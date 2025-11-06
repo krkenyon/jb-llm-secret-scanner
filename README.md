@@ -29,10 +29,12 @@ python scan.py --repo <path-or-url> --n <commits> --out report.json
 
 ## 📂 Output
 For each commit, the tool prints a short summary to the console, like:
-
+```
 [8f3b97b] Fix API key handling
   - M src/config.py
   - A src/keys.py
-
+```
 At this stage, the generated report.json is an empty list:
+```
 []
+```
