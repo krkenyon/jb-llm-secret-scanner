@@ -177,10 +177,11 @@ Diff:
         return []
 
 
+
 # ----------------------------------------------------
 # Main scan loop
 # ----------------------------------------------------
-def scan_repo(path_or_url: str, n_commits: int, output_file: str):
+def scan_repo(path_or_url: str, n_commits: int, output_file: str, use_llm: bool = False, max_diff_chars: int = 12000):
     repo, tmpdir = open_repo(path_or_url)
     results = []
 
@@ -195,23 +196,25 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str):
                 diffs = commit.diff(NULL_TREE, create_patch=True)
 
             print(f"[{commit.hexsha[:7]}] {commit.summary}")
-
-            # Combine all added lines into one diff for the LLM
-            combined_diff = ""
-            for d in diffs:
-                fname = d.b_path or d.a_path
-                patch_text = d.diff.decode("utf-8", "ignore")
-                for line in patch_text.splitlines():
-                    if line.startswith("+") and not line.startswith("+++"):
-                        clean_line = line[1:]  # strip leading '+'
-                        combined_diff += f"{fname}: {clean_line}\n"
-
+            
 
             # --- 1) LLM-first phase ---
-            llm_findings = analyze_commit_with_llm(commit.message, combined_diff)
-            for f in llm_findings:
-                f["commit"] = commit.hexsha
-                results.append(f)
+            if use_llm:
+                # Combine all added lines into one diff for the LLM
+                combined_diff = ""
+                for d in diffs:
+                    fname = d.b_path or d.a_path
+                    patch_text = d.diff.decode("utf-8", "ignore")
+                    for line in patch_text.splitlines():
+                        if line.startswith("+") and not line.startswith("+++"):
+                            clean_line = line[1:]  # strip leading '+'
+                            combined_diff += f"{fname}: {clean_line}\n"
+
+                llm_findings = analyze_commit_with_llm(commit.message, combined_diff)
+                for f in llm_findings:
+                    f["commit"] = commit.hexsha
+                    f["source"] = "llm"   # <= required for the tests to identify LLM findings
+                    results.append(f)
 
             # --- 2) Optional heuristic phase (regex + entropy) ---
             for d in diffs:
@@ -284,5 +287,10 @@ if __name__ == "__main__":
     parser.add_argument("--repo", required=True, help="Path or URL to Git repository")
     parser.add_argument("--n", type=int, required=True, help="Number of commits to scan")
     parser.add_argument("--out", required=True, help="Output JSON report path")
+    parser.add_argument("--llm", dest="use_llm", action="store_true", help="Enable LLM triage")
+    parser.add_argument("--no-llm", dest="use_llm", action="store_false", help="Disable LLM triage (default)")
+    parser.set_defaults(use_llm=False)
+    parser.add_argument("--max-diff-chars", type=int, default=12000, help="Cap combined diff sent to LLM")
+
     args = parser.parse_args()
-    scan_repo(args.repo, args.n, args.out)
+    scan_repo(args.repo, args.n, args.out, use_llm=args.use_llm, max_diff_chars=args.max_diff_chars)
