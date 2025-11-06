@@ -24,7 +24,36 @@ def get_openai_client_or_none():
         return None
     from openai import OpenAI
     return OpenAI(api_key=api_key)
+'''
+IGNORE_DIRS = {".git", ".venv", "node_modules", "dist", "build", "target", "__pycache__"}
+IGNORE_FILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock"}
+BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".jar", ".wasm"}
 
+def is_binary_diff(d) -> bool:
+    try:
+        if getattr(d, "a_blob", None) and d.a_blob is not None and d.a_blob.binary:
+            return True
+        if getattr(d, "b_blob", None) and d.b_blob is not None and d.b_blob.binary:
+            return True
+    except Exception:
+        pass
+    # Fallback by extension
+    import os
+    p = (d.b_path or d.a_path or "").lower()
+    _, ext = os.path.splitext(p)
+    return ext in BINARY_EXTS
+
+def should_ignore_path(p: str) -> bool:
+    from pathlib import PurePosixPath
+    if not p:
+        return True
+    parts = PurePosixPath(p).parts
+    if any(part in IGNORE_DIRS for part in parts):
+        return True
+    if any(p.endswith(f) for f in IGNORE_FILES):
+        return True
+    return False
+'''
 
 # ------------------------
 # Simple regex patterns for secrets
@@ -98,6 +127,40 @@ def open_repo(path_or_url: str) -> tuple[git.Repo, str | None]:
     tmpdir = tempfile.mkdtemp(prefix="jbscan_repo_")
     repo = git.Repo.clone_from(path_or_url, tmpdir)
     return repo, tmpdir
+
+def _key_for_merge(f: dict) -> tuple:
+    return (
+        f.get("commit"),
+        f.get("file_path") or f.get("path") or "",
+        (f.get("line_snippet") or f.get("snippet") or "")[:160].strip().lower()
+    )
+
+def merge_findings(findings: list[dict]) -> list[dict]:
+    merged = {}
+    for f in findings:
+        f.setdefault("confidence", 0.5)
+        f.setdefault("finding_type", "Potential Secret")
+
+        k = _key_for_merge(f)
+        if k not in merged:
+            merged[k] = f
+        else:
+            cur = merged[k]
+            # keep highest confidence
+            if f.get("confidence", 0) > cur.get("confidence", 0):
+                cur["confidence"] = f["confidence"]
+                cur["finding_type"] = f.get("finding_type", cur.get("finding_type"))
+                # prefer path if missing
+                if not cur.get("file_path") and f.get("file_path"):
+                    cur["file_path"] = f["file_path"]
+            # concat rationales
+            r1 = cur.get("rationale", "")
+            r2 = f.get("rationale", "")
+            merged[k]["rationale"] = " | ".join(x for x in [r1, r2] if x).strip()
+            # combine sources
+            srcs = set((cur.get("source","") + "," + f.get("source","")).split(","))
+            merged[k]["source"] = ",".join(sorted(s for s in srcs if s))
+    return list(merged.values())
 
 
 # ----------------------------------------------------
@@ -249,7 +312,8 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str, use_llm: bool 
                                 "line_snippet": clean_line.strip()[:200],
                                 "finding_type": patt_name,
                                 "rationale": f"Matched pattern: {patt_name}",
-                                "confidence": 0.9
+                                "confidence": 0.9,
+                                "source": "regex"
                             })
 
                     # Entropy pass
@@ -267,12 +331,15 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str, use_llm: bool 
                                 "line_snippet": tok[:200],
                                 "finding_type": "High-Entropy String",
                                 "rationale": f"High-entropy token detected (H≈{H:.2f}).",
-                                "confidence": round(conf, 2)
+                                "confidence": round(conf, 2),
+                                "source": "entropy"
                             })
+        # Merge duplicates and bump confidence/source/rationale
+        merged = merge_findings(results)
 
         with open(output_file, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"\nWrote report to {output_file} (findings={len(results)})")
+            json.dump(merged, f, indent=2)
+        print(f"\nWrote report to {output_file} (findings={len(merged)})")
 
     finally:
         if tmpdir and os.path.isdir(tmpdir):
