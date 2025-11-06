@@ -1,0 +1,19 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+*.log
+
+# Virtual environments
+venv/
+.env/
+env/
+.venv/
+
+# Output / reports
+report.json
+example_report.json
+*.json
