@@ -17,3 +17,5 @@ env/
 report.json
 example_report.json
 *.json
+
+.env

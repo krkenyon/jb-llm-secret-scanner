@@ -16,6 +16,14 @@ git clone https://github.com/<yourusername>/jb-llm-secret-scanner.git
 cd jb-llm-secret-scanner
 pip install -r requirements.txt
 ```
+
+### Environment setup
+
+This project uses OpenAI’s API for LLM analysis.  
+Create a `.env` file in the project root with your API key:
+```
+OPENAI_API_KEY=your-openai-api-key
+```
 ---
 
 ## 🧠 Usage
