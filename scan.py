@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import shutil
 import tempfile
 from pathlib import Path
@@ -9,7 +10,17 @@ from math import log2
 
 import git
 from git import NULL_TREE
+from openai import OpenAI
+from dotenv import load_dotenv
 
+# ----------------------------------------------------
+# OpenAI setup
+# ----------------------------------------------------
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    sys.exit("OPENAI_API_KEY environment variable not set. Please export it before running.")
+client = OpenAI(api_key=api_key)
 
 # ------------------------
 # Simple regex patterns for secrets
@@ -32,7 +43,9 @@ ENTROPY_MIN_LEN = 20             # tokens shorter than this are rarely real secr
 ENTROPY_THRESHOLD = 3.5          # bits/char; raise to reduce noise
 BASE64_LIKE = re.compile(r"\b[A-Za-z0-9+/_-]{20,}={0,2}\b")  # catch base64-ish/ID-like
 PURE_HEX = re.compile(r"^[0-9a-fA-F]+$")
-UUID_LIKE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+UUID_LIKE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
 
 # --------------------------------------------
 # Shannon Entropy Calculator
@@ -70,6 +83,9 @@ def shannon_entropy(s: str) -> float:
     return H
 
 
+# ----------------------------------------------------
+# Open a repository (local or remote)
+# ----------------------------------------------------
 def open_repo(path_or_url: str) -> tuple[git.Repo, str | None]:
     p = Path(path_or_url)
     if p.exists() and p.is_dir():
@@ -80,6 +96,83 @@ def open_repo(path_or_url: str) -> tuple[git.Repo, str | None]:
     return repo, tmpdir
 
 
+# ----------------------------------------------------
+# LLM analysis of commit
+# ----------------------------------------------------
+def extract_json_from_text(text: str):
+    """
+    Extract the first valid JSON array/object from a text block.
+    Handles Markdown code fences like ```json ... ```.
+    Returns [] if nothing parseable is found.
+    """
+    t = text.strip()
+
+    # If fenced, prefer the fenced content
+    m = re.search(r"```(?:json)?\s*(.*?)\s*```", t, re.S | re.I)
+    if m:
+        t = m.group(1).strip()
+
+    # Try direct parse
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        # Fallback: grab first {...} or [...] chunk
+        m2 = re.search(r"(\{.*\}|\[.*\])", t, re.S)
+        if m2:
+            try:
+                return json.loads(m2.group(1))
+            except json.JSONDecodeError:
+                pass
+    return []
+
+def analyze_commit_with_llm(commit_msg: str, diff_text: str):
+    """
+    Ask the LLM to find secrets or sensitive data in this commit.
+    Returns a list of findings.
+    """
+    prompt = f"""
+You are a security engineer reviewing a git commit diff.
+Analyze the following diff and commit message for any potential secrets,
+API keys, credentials, or other sensitive data.
+
+Return JSON list of findings, each with:
+  file_path
+  line_snippet
+  finding_type
+  rationale
+  confidence (0.0–1.0)
+Return ONLY valid JSON, with no extra commentary or text.
+
+Commit message:
+{commit_msg}
+
+Diff:
+{diff_text}
+"""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an expert security analyst."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
+        text = resp.choices[0].message.content.strip()
+        data = extract_json_from_text(text)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return [data]
+        return []
+    except Exception as e:
+        print(f"LLM analysis failed: {e}")
+        return []
+
+
+# ----------------------------------------------------
+# Main scan loop
+# ----------------------------------------------------
 def scan_repo(path_or_url: str, n_commits: int, output_file: str):
     repo, tmpdir = open_repo(path_or_url)
     results = []
@@ -89,13 +182,31 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str):
         for commit in commits:
             if commit.parents:
                 parent = commit.parents[0]
-                diffs = parent.diff(commit, create_patch=True)  # rename-aware
+                diffs = parent.diff(commit, create_patch=True)
             else:
                 # initial commit
                 diffs = commit.diff(NULL_TREE, create_patch=True)
 
             print(f"[{commit.hexsha[:7]}] {commit.summary}")
 
+            # Combine all added lines into one diff for the LLM
+            combined_diff = ""
+            for d in diffs:
+                fname = d.b_path or d.a_path
+                patch_text = d.diff.decode("utf-8", "ignore")
+                for line in patch_text.splitlines():
+                    if line.startswith("+") and not line.startswith("+++"):
+                        clean_line = line[1:]  # strip leading '+'
+                        combined_diff += f"{fname}: {clean_line}\n"
+
+
+            # --- 1) LLM-first phase ---
+            llm_findings = analyze_commit_with_llm(commit.message, combined_diff)
+            for f in llm_findings:
+                f["commit"] = commit.hexsha
+                results.append(f)
+
+            # --- 2) Optional heuristic phase (regex + entropy) ---
             for d in diffs:
                 # Robust change-type derivation
                 if getattr(d, "new_file", False):
@@ -119,7 +230,7 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str):
                         continue
                     clean_line = line[1:]
 
-                    # 1) Regex pass
+                    # Regex pass
                     for patt_name, pattern in SECRET_PATTERNS:
                         if re.search(pattern, clean_line):
                             results.append({
@@ -131,16 +242,12 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str):
                                 "confidence": 0.9
                             })
 
-                    # 2) Entropy pass
+                    # Entropy pass
                     for tok in BASE64_LIKE.findall(clean_line):
-                        # quick false-positive guards
                         if len(tok) < ENTROPY_MIN_LEN:
                             continue
-                        if PURE_HEX.match(tok):
+                        if PURE_HEX.match(tok) or UUID_LIKE.match(tok):
                             continue
-                        if UUID_LIKE.match(tok):
-                            continue
-
                         H = shannon_entropy(tok)
                         if H >= ENTROPY_THRESHOLD:
                             results.append({
@@ -148,26 +255,26 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str):
                                 "file_path": fname,
                                 "line_snippet": tok[:200],
                                 "finding_type": "High-Entropy String",
-                                "rationale": f"High-entropy token detected (H≈{H:.2f} bits/char).",
+                                "rationale": f"High-entropy token detected (H≈{H:.2f}).",
                                 "confidence": 0.6
                             })
 
         with open(output_file, "w") as f:
             json.dump(results, f, indent=2)
-
         print(f"\nWrote report to {output_file} (findings={len(results)})")
 
     finally:
-        # Clean up temp clone if we created one
         if tmpdir and os.path.isdir(tmpdir):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ----------------------------------------------------
+# CLI entry point
+# ----------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scan last N commits for secrets (regex + entropy)")
+    parser = argparse.ArgumentParser(description="LLM-powered secret scanner for Git commits")
     parser.add_argument("--repo", required=True, help="Path or URL to Git repository")
     parser.add_argument("--n", type=int, required=True, help="Number of commits to scan")
     parser.add_argument("--out", required=True, help="Output JSON report path")
     args = parser.parse_args()
-
     scan_repo(args.repo, args.n, args.out)
