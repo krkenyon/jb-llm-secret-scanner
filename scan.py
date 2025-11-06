@@ -347,27 +347,25 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str, use_llm: bool 
                     continue
 
                 patch_text = d.diff.decode("utf-8", "ignore")
+                # Iterate added lines WITH line numbers
+                for lineno, clean_line in iter_added_lines_with_lineno(patch_text):
 
-                # Scan only added lines
-                for line in patch_text.splitlines():
-                    if not line.startswith("+") or line.startswith("+++"):
-                        continue
-                    clean_line = line[1:]
-
-                    # Regex pass
+                    # ---- Regex pass (all matches per line, no offsets)
                     for patt_name, pattern in SECRET_PATTERNS:
                         if re.search(pattern, clean_line):
                             results.append({
                                 "commit": commit.hexsha,
                                 "file_path": fname,
+                                "line_start": lineno,          # << directly after file_path
+                                "line_end": lineno,            # << directly after file_path
                                 "line_snippet": clean_line.strip()[:200],
                                 "finding_type": patt_name,
                                 "rationale": f"Matched pattern: {patt_name}",
                                 "confidence": 0.9,
-                                "source": "regex"
+                                "source": "regex",
                             })
 
-                    # Entropy pass
+                    # ---- Entropy pass (no offsets; snippet = token)
                     for tok in BASE64_LIKE.findall(clean_line):
                         if len(tok) < ENTROPY_MIN_LEN:
                             continue
@@ -375,15 +373,17 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str, use_llm: bool 
                             continue
                         H = shannon_entropy(tok)
                         if H >= ENTROPY_THRESHOLD:
-                            conf = min(1.0, max(0.0, (H - 3.0) / 3.0))
+                            conf = min(1.0, max(0.0, (H - 3.0) / 3.0))  # entropy → confidence
                             results.append({
                                 "commit": commit.hexsha,
                                 "file_path": fname,
+                                "line_start": lineno,          # << directly after file_path
+                                "line_end": lineno,            # << directly after file_path
                                 "line_snippet": tok[:200],
                                 "finding_type": "High-Entropy String",
                                 "rationale": f"High-entropy token detected (H≈{H:.2f}).",
                                 "confidence": round(conf, 2),
-                                "source": "entropy"
+                                "source": "entropy",
                             })
         # Merge duplicates and bump confidence/source/rationale
         merged = merge_findings(results)
