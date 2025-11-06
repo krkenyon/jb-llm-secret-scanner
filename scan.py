@@ -11,16 +11,20 @@ from math import log2
 import git
 from git import NULL_TREE
 from openai import OpenAI
-from dotenv import load_dotenv
 
 # ----------------------------------------------------
-# OpenAI setup
+# Optional OpenAI setup (lazy)
 # ----------------------------------------------------
+from dotenv import load_dotenv
 load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    sys.exit("OPENAI_API_KEY environment variable not set. Please export it before running.")
-client = OpenAI(api_key=api_key)
+
+def get_openai_client_or_none():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    from openai import OpenAI
+    return OpenAI(api_key=api_key)
+
 
 # ------------------------
 # Simple regex patterns for secrets
@@ -149,6 +153,9 @@ Commit message:
 Diff:
 {diff_text}
 """
+    client = get_openai_client_or_none()
+    if client is None:
+        return []  # LLM disabled/missing key; safe no-op
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
