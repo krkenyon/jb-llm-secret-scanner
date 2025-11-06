@@ -128,6 +128,13 @@ def open_repo(path_or_url: str) -> tuple[git.Repo, str | None]:
     repo = git.Repo.clone_from(path_or_url, tmpdir)
     return repo, tmpdir
 
+def _combine_confidence(c1: float, c2: float) -> float:
+    """Combine two confidence values with diminishing returns."""
+    # Simple probabilistic union: 1 - (1-c1)*(1-c2)
+    # Ensures the combined score is higher than either input but never >1.0
+    combined = 1 - (1 - min(1, c1)) * (1 - min(1, c2))
+    return round(min(1.0, combined), 3)
+
 def _key_for_merge(f: dict) -> tuple:
     return (
         f.get("commit"),
@@ -148,7 +155,7 @@ def merge_findings(findings: list[dict]) -> list[dict]:
             cur = merged[k]
             # keep highest confidence
             if f.get("confidence", 0) > cur.get("confidence", 0):
-                cur["confidence"] = f["confidence"]
+                cur["confidence"] = _combine_confidence(cur.get("confidence", 0.0), f.get("confidence", 0.0))
                 cur["finding_type"] = f.get("finding_type", cur.get("finding_type"))
                 # prefer path if missing
                 if not cur.get("file_path") and f.get("file_path"):
