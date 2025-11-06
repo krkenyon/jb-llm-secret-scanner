@@ -24,7 +24,7 @@ def get_openai_client_or_none():
         return None
     from openai import OpenAI
     return OpenAI(api_key=api_key)
-'''
+
 IGNORE_DIRS = {".git", ".venv", "node_modules", "dist", "build", "target", "__pycache__"}
 IGNORE_FILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock"}
 BINARY_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".jar", ".wasm"}
@@ -53,7 +53,7 @@ def should_ignore_path(p: str) -> bool:
     if any(p.endswith(f) for f in IGNORE_FILES):
         return True
     return False
-'''
+
 
 # ------------------------
 # Simple regex patterns for secrets
@@ -169,6 +169,55 @@ def merge_findings(findings: list[dict]) -> list[dict]:
             merged[k]["source"] = ",".join(sorted(s for s in srcs if s))
     return list(merged.values())
 
+HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@')
+
+def iter_added_lines_with_lineno(patch_text: str):
+    """
+    Yield tuples: (lineno, text) for added lines in a unified diff patch.
+    """
+    curr = None
+    for raw in patch_text.splitlines():
+        if raw.startswith('@@'):
+            m = HUNK_RE.match(raw)
+            if m:
+                start = int(m.group('start'))
+                curr = {"lineno": start}
+            continue
+        if curr is None:
+            continue
+        if raw.startswith('+') and not raw.startswith('+++'):
+            yield curr["lineno"], raw[1:]
+            curr["lineno"] += 1
+        elif raw.startswith('-') and not raw.startswith('---'):
+            # deletion does not advance target line
+            pass
+        else:
+            # context line
+            curr["lineno"] += 1
+
+
+def build_combined_added_diff(diffs, max_chars: int):
+    parts = []
+    used = 0
+    for d in diffs:
+        fname = d.b_path or d.a_path
+        if should_ignore_path(fname) or is_binary_diff(d) or d.diff is None:
+            continue
+        patch_text = d.diff.decode("utf-8", "ignore")
+        file_lines = []
+        for lineno, clean_line in iter_added_lines_with_lineno(patch_text):
+            s = f"{fname}:{lineno}: {clean_line}\n"
+            if used + len(s) > max_chars:
+                break
+            file_lines.append(s)
+            used += len(s)
+        if file_lines:
+            parts.append("".join(file_lines))
+        if used >= max_chars:
+            break
+    return "".join(parts)
+
+
 
 # ----------------------------------------------------
 # LLM analysis of commit
@@ -211,6 +260,8 @@ API keys, credentials, or other sensitive data.
 
 Return JSON list of findings, each with:
   file_path
+  line_start (first line number of the snippet)
+  line_end   (same as line_start if single line)
   line_snippet
   finding_type
   rationale
@@ -271,14 +322,7 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str, use_llm: bool 
             # --- 1) LLM-first phase ---
             if use_llm:
                 # Combine all added lines into one diff for the LLM
-                combined_diff = ""
-                for d in diffs:
-                    fname = d.b_path or d.a_path
-                    patch_text = d.diff.decode("utf-8", "ignore")
-                    for line in patch_text.splitlines():
-                        if line.startswith("+") and not line.startswith("+++"):
-                            clean_line = line[1:]  # strip leading '+'
-                            combined_diff += f"{fname}: {clean_line}\n"
+                combined_diff = build_combined_added_diff(diffs, max_diff_chars)
 
                 llm_findings = analyze_commit_with_llm(commit.message, combined_diff)
                 for f in llm_findings:
