@@ -250,13 +250,14 @@ def scan_repo(path_or_url: str, n_commits: int, output_file: str):
                             continue
                         H = shannon_entropy(tok)
                         if H >= ENTROPY_THRESHOLD:
+                            conf = min(1.0, max(0.0, (H - 3.0) / 3.0))
                             results.append({
                                 "commit": commit.hexsha,
                                 "file_path": fname,
                                 "line_snippet": tok[:200],
                                 "finding_type": "High-Entropy String",
                                 "rationale": f"High-entropy token detected (H≈{H:.2f}).",
-                                "confidence": 0.6
+                                "confidence": round(conf, 2)
                             })
 
         with open(output_file, "w") as f:
