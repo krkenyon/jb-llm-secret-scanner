@@ -57,8 +57,6 @@ python scan.py \
   [--llm] \
   [--no-llm] \
   [--min-confidence 0.6] \
-  [--exclude "node_modules,dist,*.png"] \
-  [--model gpt-4o-mini] \
   [--max-diff-chars 12000]
 ```
 Options
