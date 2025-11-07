@@ -7,6 +7,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from math import log2
+from datetime import datetime, timezone
 
 import git
 from git import NULL_TREE
@@ -24,6 +25,10 @@ def get_openai_client_or_none():
         return None
     from openai import OpenAI
     return OpenAI(api_key=api_key)
+
+# ----------------------------------------------------
+# Ignore lists for paths
+# ----------------------------------------------------
 
 IGNORE_DIRS = {".git", ".venv", "node_modules", "dist", "build", "target", "__pycache__"}
 IGNORE_FILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock"}
@@ -128,6 +133,9 @@ def open_repo(path_or_url: str) -> tuple[git.Repo, str | None]:
     repo = git.Repo.clone_from(path_or_url, tmpdir)
     return repo, tmpdir
 
+# ----------------------------------------------------
+# Merge findings from multiple sources
+# ----------------------------------------------------
 def _combine_confidence(c1: float, c2: float) -> float:
     """Combine two confidence values with diminishing returns."""
     # Simple probabilistic union: 1 - (1-c1)*(1-c2)
@@ -169,8 +177,9 @@ def merge_findings(findings: list[dict]) -> list[dict]:
             merged[k]["source"] = ",".join(sorted(s for s in srcs if s))
     return list(merged.values())
 
-from datetime import datetime, timezone
-
+# ----------------------------------------------------
+# Build final report structure
+# ----------------------------------------------------
 def make_report(repo_source: str, commits_scanned: list[str], findings: list, errors: list[str]):
     return {
         "repo": repo_source,
@@ -189,7 +198,9 @@ def make_report(repo_source: str, commits_scanned: list[str], findings: list, er
         "errors": errors,
     }
 
-
+# ----------------------------------------------------
+# Patch parsing: iterate added lines with line numbers
+# ----------------------------------------------------
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@')
 
 def iter_added_lines_with_lineno(patch_text: str):
@@ -216,7 +227,9 @@ def iter_added_lines_with_lineno(patch_text: str):
             # context line
             curr["lineno"] += 1
 
-
+# ----------------------------------------------------
+# Build combined added diff for LLM analysis
+# ----------------------------------------------------
 def build_combined_added_diff(diffs, max_chars: int):
     parts = []
     used = 0
@@ -237,8 +250,6 @@ def build_combined_added_diff(diffs, max_chars: int):
         if used >= max_chars:
             break
     return "".join(parts)
-
-
 
 # ----------------------------------------------------
 # LLM analysis of commit
