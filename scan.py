@@ -169,6 +169,27 @@ def merge_findings(findings: list[dict]) -> list[dict]:
             merged[k]["source"] = ",".join(sorted(s for s in srcs if s))
     return list(merged.values())
 
+from datetime import datetime, timezone
+
+def make_report(repo_source: str, commits_scanned: list[str], findings: list, errors: list[str]):
+    return {
+        "repo": repo_source,
+        "scanned_at": datetime.now(timezone.utc).isoformat(),
+        "commit_window": {
+            "n": len(commits_scanned),
+            "from": commits_scanned[-1] if commits_scanned else None,
+            "to": commits_scanned[0] if commits_scanned else None,
+        },
+        "findings": findings,
+        "stats": {
+            "commits_scanned": len(commits_scanned),
+            "findings": len(findings),
+            "files_touched": None,  # could compute if you want
+        },
+        "errors": errors,
+    }
+
+
 HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<count>\d+))? @@')
 
 def iter_added_lines_with_lineno(patch_text: str):
@@ -302,95 +323,114 @@ Diff:
 # ----------------------------------------------------
 # Main scan loop
 # ----------------------------------------------------
-def scan_repo(path_or_url: str, n_commits: int, output_file: str, use_llm: bool = False, max_diff_chars: int = 12000):
+def scan_repo(
+    path_or_url: str,
+    n_commits: int,
+    output_file: str,
+    use_llm: bool = False,
+    max_diff_chars: int = 12000,
+):
     repo, tmpdir = open_repo(path_or_url)
-    results = []
+    results: list[dict] = []
+    errors: list[str] = []
 
     try:
+        # Collect commits and hashes up-front for provenance in the report
         commits = list(repo.iter_commits("HEAD", max_count=n_commits))
+        commit_hashes = [c.hexsha for c in commits]
+
         for commit in commits:
-            if commit.parents:
-                parent = commit.parents[0]
-                diffs = parent.diff(commit, create_patch=True)
-            else:
-                # initial commit
-                diffs = commit.diff(NULL_TREE, create_patch=True)
-
-            print(f"[{commit.hexsha[:7]}] {commit.summary}")
-            
-
-            # --- 1) LLM-first phase ---
-            if use_llm:
-                # Combine all added lines into one diff for the LLM
-                combined_diff = build_combined_added_diff(diffs, max_diff_chars)
-
-                llm_findings = analyze_commit_with_llm(commit.message, combined_diff)
-                for f in llm_findings:
-                    f["commit"] = commit.hexsha
-                    f["source"] = "llm"   # <= required for the tests to identify LLM findings
-                    results.append(f)
-
-            # --- 2) Optional heuristic phase (regex + entropy) ---
-            for d in diffs:
-                # Robust change-type derivation
-                if getattr(d, "new_file", False):
-                    ctype = "A"
-                elif getattr(d, "deleted_file", False):
-                    ctype = "D"
+            try:
+                if commit.parents:
+                    parent = commit.parents[0]
+                    diffs = parent.diff(commit, create_patch=True)
                 else:
-                    ctype = "M"  # default to modified
+                    # initial commit
+                    diffs = commit.diff(NULL_TREE, create_patch=True)
 
-                # d.a_path or d.b_path depending on add/delete/modify
-                fname = d.b_path or d.a_path
-                print(f"  - {ctype} {fname}")
-                if not fname or d.diff is None:
-                    continue
+                print(f"[{commit.hexsha[:7]}] {commit.summary}")
 
-                patch_text = d.diff.decode("utf-8", "ignore")
-                # Iterate added lines WITH line numbers
-                for lineno, clean_line in iter_added_lines_with_lineno(patch_text):
+                # --- 1) LLM-first phase (build combined diff only if enabled) ---
+                if use_llm:
+                    combined_diff = build_combined_added_diff(diffs, max_diff_chars)
+                    if combined_diff:
+                        llm_findings = analyze_commit_with_llm(commit.message, combined_diff)
+                        for f in llm_findings:
+                            f["commit"] = commit.hexsha
+                            f["source"] = "llm"  # tag for provenance/merging
+                            results.append(f)
 
-                    # ---- Regex pass (all matches per line, no offsets)
-                    for patt_name, pattern in SECRET_PATTERNS:
-                        if re.search(pattern, clean_line):
-                            results.append({
-                                "commit": commit.hexsha,
-                                "file_path": fname,
-                                "line_start": lineno,          # << directly after file_path
-                                "line_end": lineno,            # << directly after file_path
-                                "line_snippet": clean_line.strip()[:200],
-                                "finding_type": patt_name,
-                                "rationale": f"Matched pattern: {patt_name}",
-                                "confidence": 0.9,
-                                "source": "regex",
-                            })
+                # --- 2) Heuristic phase (regex + entropy) ---
+                for d in diffs:
+                    # Robust change-type derivation (debugging/trace)
+                    if getattr(d, "new_file", False):
+                        ctype = "A"
+                    elif getattr(d, "deleted_file", False):
+                        ctype = "D"
+                    else:
+                        ctype = "M"  # default to modified
 
-                    # ---- Entropy pass (no offsets; snippet = token)
-                    for tok in BASE64_LIKE.findall(clean_line):
-                        if len(tok) < ENTROPY_MIN_LEN:
-                            continue
-                        if PURE_HEX.match(tok) or UUID_LIKE.match(tok):
-                            continue
-                        H = shannon_entropy(tok)
-                        if H >= ENTROPY_THRESHOLD:
-                            conf = min(1.0, max(0.0, (H - 3.0) / 3.0))  # entropy → confidence
-                            results.append({
-                                "commit": commit.hexsha,
-                                "file_path": fname,
-                                "line_start": lineno,          # << directly after file_path
-                                "line_end": lineno,            # << directly after file_path
-                                "line_snippet": tok[:200],
-                                "finding_type": "High-Entropy String",
-                                "rationale": f"High-entropy token detected (H≈{H:.2f}).",
-                                "confidence": round(conf, 2),
-                                "source": "entropy",
-                            })
-        # Merge duplicates and bump confidence/source/rationale
+                    fname = d.b_path or d.a_path
+                    print(f"  - {ctype} {fname}")
+                    if not fname or d.diff is None:
+                        continue
+
+                    patch_text = d.diff.decode("utf-8", "ignore")
+
+                    # Iterate added lines WITH line numbers
+                    for lineno, clean_line in iter_added_lines_with_lineno(patch_text):
+
+                        # ---- Regex pass
+                        for patt_name, pattern in SECRET_PATTERNS:
+                            if re.search(pattern, clean_line):
+                                results.append({
+                                    "commit": commit.hexsha,
+                                    "file_path": fname,
+                                    "line_start": lineno,   # immediately after file_path
+                                    "line_end": lineno,
+                                    "line_snippet": clean_line.strip()[:200],
+                                    "finding_type": patt_name,
+                                    "rationale": f"Matched pattern: {patt_name}",
+                                    "confidence": 0.9,
+                                    "source": "regex",
+                                })
+
+                        # ---- Entropy pass
+                        for tok in BASE64_LIKE.findall(clean_line):
+                            if len(tok) < ENTROPY_MIN_LEN:
+                                continue
+                            if PURE_HEX.match(tok) or UUID_LIKE.match(tok):
+                                continue
+                            H = shannon_entropy(tok)
+                            if H >= ENTROPY_THRESHOLD:
+                                conf = min(1.0, max(0.0, (H - 3.0) / 3.0))  # entropy → confidence
+                                results.append({
+                                    "commit": commit.hexsha,
+                                    "file_path": fname,
+                                    "line_start": lineno,   # immediately after file_path
+                                    "line_end": lineno,
+                                    "line_snippet": tok[:200],
+                                    "finding_type": "High-Entropy String",
+                                    "rationale": f"High-entropy token detected (H≈{H:.2f}).",
+                                    "confidence": round(conf, 2),
+                                    "source": "entropy",
+                                })
+
+            except Exception as e:
+                # Capture per-commit errors but keep scanning
+                msg = f"Commit {commit.hexsha[:7]} failed: {e}"
+                print(f"⚠️ {msg}")
+                errors.append(msg)
+
+        # --- 3) Merge duplicates / combine sources & confidence
         merged = merge_findings(results)
 
+        # --- 4) Build and write structured report
+        report = make_report(path_or_url, commit_hashes, merged, errors)
         with open(output_file, "w") as f:
-            json.dump(merged, f, indent=2)
-        print(f"\nWrote report to {output_file} (findings={len(merged)})")
+            json.dump(report, f, indent=2)
+
+        print(f"\nWrote report to {output_file} (findings={len(merged)}, errors={len(errors)})")
 
     finally:
         if tmpdir and os.path.isdir(tmpdir):
