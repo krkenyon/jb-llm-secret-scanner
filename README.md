@@ -44,7 +44,11 @@ pip install -r requirements.txt
 echo "OPENAI_API_KEY=your_api_key_here" > .env
 ```
 Note: You must have a valid OPENAI_API_KEY in your environment for the LLM phase to work. If it’s not set, the tool will run in “no-LLM” mode.
-🚀 Usage
+
+---
+
+## 🚀 Usage
+
 ```bash
 python scan.py \
   --repo /path/to/repo \
@@ -58,15 +62,27 @@ python scan.py \
   [--max-diff-chars 12000]
 ```
 Options
+
 --repo : Path or URL to Git repo
+
 --n : Number of recent commits to scan
+
 --out : Path for the JSON output report
+
 --llm / --no-llm : Enable or disable LLM phase (default: disabled)
+
 --min-confidence : Minimum confidence threshold for findings to be included
+
 --exclude : Comma-separated glob/list of paths to skip
+
 --model : Name of the LLM model to use (if LLM enabled)
+
 --max-diff-chars : Maximum combined diff size sent to the LLM
-📘 Example Output (report.json)
+
+---
+
+## 📘 Example Output (report.json)
+
 ```json
 {
   "repo": "/path/to/repo",
@@ -108,19 +124,23 @@ Options
   "errors": []
 }
 ```
-🧪 Testing
+---
+
+## 🧪 Testing
+
 Run the test suite with:
 ```bash
 pytest -v
 ```
 There are integration tests for:
 regex/entropy scanning without LLM
-LLM-enabled scans (with mock)
-Confidence threshold filtering
-Report format assertions
+LLM-enabled scans
 If you add new detection patterns or adjust logic, make sure to add coverage there.
 
-⚠️ Limitations & Future Work
+---
+
+## ⚠️ Limitations & Future Work
+
 This scanner focuses on added lines in commits, so secrets previously committed but unchanged might escape detection.
 When two different secrets occur on the same line, merging logic may need further tuning to distinguish them.
 LLM cost and latency: enabling --llm will incur API calls; caching helps but be mindful in CI.
@@ -131,7 +151,10 @@ multi-line secret detection (private keys)
 real-time CI integration (pre-commit hooks)
 support for alternative LLM providers or self-hosted models
 
-🧑‍💻 How it works (high level)
+---
+
+## 🧑‍💻 How it works (high level)
+
 Clone or open provided repo path, fetch last n commits.
 For each commit, build a diff of added lines.
 Heuristic pass: scan each added line for:
@@ -141,10 +164,16 @@ LLM pass (optional): send a combined diff text to an LLM with prompt context; LL
 Merge pass: combine overlapping findings (same commit + file + line/snippet overlap) from multiple sources → boost confidence, unify sources.
 Write JSON report with metadata, findings, stats and optionally errors.
 
-📄 License
+---
+
+## 📄 License
+
 MIT License — feel free to use, modify and integrate into CI/CD workflows.
 
-💬 Contributing
+---
+
+## 💬 Contributing
+
 Contributions welcome! Please open issues or pull requests for:
 new secret-pattern regex rules
 enhancements for entropy logic
