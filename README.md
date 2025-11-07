@@ -141,16 +141,11 @@ LLM cost and latency: enabling --llm will incur API calls; caching calls might h
 Entropy thresholds and regex patterns may produce false positives (placeholders, test keys). Consider refining patterns or adding exclusions.
 
 Future enhancements might include:
-multi-line secret detection (private keys)
-real-time CI integration (pre-commit hooks)
-support for alternative LLM providers or self-hosted models
-checks for personal information, for example:
- - Credit Card Numbers
- - IBAN / Bank Account Numbers	
- - Social Security Numbers	
- - Email Addresses	
- - Phone Numbers	
- - Names / Addresses
+- multi-line secret detection (private keys)
+- real-time CI integration (pre-commit hooks)
+- extension of the CLI to allow users to configure more runtime parameters (e.g. minimum confidence thresholds, entropy sensitivity, excluded paths, LLM model selection)
+- support for alternative LLM providers or self-hosted models
+- checks for personal information (e.g. Credit Card Numbers, Social Security Numbers, Phone Numbers, Names / Addresses)
 
 ---
 
@@ -164,7 +159,7 @@ Heuristic pass: scan each added line for:
 
 - regex matches → “finding_type” tags (AWS Access Key, Stripe Key, etc.)
 - high‐entropy tokens (via Shannon entropy) → generic “High-Entropy String” findings
-- 
+
 LLM pass (optional): send a combined diff text to an LLM with prompt context; LLM returns findings with file_path, line_start, line_end, snippet, rationale, confidence.
 
 Merge pass: combine overlapping findings (same commit + file + line/snippet overlap) from multiple sources → boost confidence, unify sources.
