@@ -62,13 +62,21 @@ python scan.py \
   [--max-diff-chars 12000]
 ```
 Options
+
 --repo : Path or URL to Git repo
+
 --n : Number of recent commits to scan
+
 --out : Path for the JSON output report
+
 --llm / --no-llm : Enable or disable LLM phase (default: disabled)
+
 --min-confidence : Minimum confidence threshold for findings to be included
+
 --exclude : Comma-separated glob/list of paths to skip
+
 --model : Name of the LLM model to use (if LLM enabled)
+
 --max-diff-chars : Maximum combined diff size sent to the LLM
 
 ---
