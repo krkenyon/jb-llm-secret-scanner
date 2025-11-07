@@ -71,12 +71,6 @@ Options
 
 --llm / --no-llm : Enable or disable LLM phase (default: disabled)
 
---min-confidence : Minimum confidence threshold for findings to be included
-
---exclude : Comma-separated glob/list of paths to skip
-
---model : Name of the LLM model to use (if LLM enabled)
-
 --max-diff-chars : Maximum combined diff size sent to the LLM
 
 ---
@@ -132,7 +126,7 @@ Run the test suite with:
 ```bash
 pytest -v
 ```
-There are integration tests for:
+There are minimal integration tests for:
 regex/entropy scanning without LLM
 LLM-enabled scans
 If you add new detection patterns or adjust logic, make sure to add coverage there.
@@ -143,25 +137,38 @@ If you add new detection patterns or adjust logic, make sure to add coverage the
 
 This scanner focuses on added lines in commits, so secrets previously committed but unchanged might escape detection.
 When two different secrets occur on the same line, merging logic may need further tuning to distinguish them.
-LLM cost and latency: enabling --llm will incur API calls; caching helps but be mindful in CI.
+LLM cost and latency: enabling --llm will incur API calls; caching calls might help this.
 Entropy thresholds and regex patterns may produce false positives (placeholders, test keys). Consider refining patterns or adding exclusions.
 
 Future enhancements might include:
 multi-line secret detection (private keys)
 real-time CI integration (pre-commit hooks)
 support for alternative LLM providers or self-hosted models
+checks for personal information, for example:
+ - Credit Card Numbers
+ - IBAN / Bank Account Numbers	
+ - Social Security Numbers	
+ - Email Addresses	
+ - Phone Numbers	
+ - Names / Addresses
 
 ---
 
 ## 🧑‍💻 How it works (high level)
 
 Clone or open provided repo path, fetch last n commits.
+
 For each commit, build a diff of added lines.
+
 Heuristic pass: scan each added line for:
-regex matches → “finding_type” tags (AWS Access Key, Stripe Key, etc.)
-high‐entropy tokens (via Shannon entropy) → generic “High-Entropy String” findings
+
+- regex matches → “finding_type” tags (AWS Access Key, Stripe Key, etc.)
+- high‐entropy tokens (via Shannon entropy) → generic “High-Entropy String” findings
+- 
 LLM pass (optional): send a combined diff text to an LLM with prompt context; LLM returns findings with file_path, line_start, line_end, snippet, rationale, confidence.
+
 Merge pass: combine overlapping findings (same commit + file + line/snippet overlap) from multiple sources → boost confidence, unify sources.
+
 Write JSON report with metadata, findings, stats and optionally errors.
 
 ---
