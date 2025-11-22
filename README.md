@@ -1,4 +1,4 @@
-# JB-LLM-Secret-Scanner
+# LLM-Secret-Scanner
 
 A command-line tool to scan the last _N_ commits of a Git repository for secrets or other sensitive data, powered by heuristics (regex + entropy) **and optionally** a Large Language Model (LLM).
 
