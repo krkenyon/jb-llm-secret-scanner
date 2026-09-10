@@ -57,6 +57,9 @@ python scan.py \
   [--llm] \
   [--no-llm] \
   [--min-confidence 0.6] \
+  [--entropy-threshold 3.5] \
+  [--exclude "tests/**"] \
+  [--llm-cache .cache/jbscan-llm.json] \
   [--max-diff-chars 12000]
 ```
 Options
@@ -68,6 +71,14 @@ Options
 --out : Path for the JSON output report
 
 --llm / --no-llm : Enable or disable LLM phase (default: disabled)
+
+--min-confidence : Minimum confidence required in the final report
+
+--entropy-threshold : Shannon entropy cutoff for generic high-entropy token findings
+
+--exclude : Additional path glob to skip; can be supplied more than once
+
+--llm-cache : Optional JSON cache file for LLM findings
 
 --max-diff-chars : Maximum combined diff size sent to the LLM
 
@@ -111,7 +122,10 @@ Options
   "stats": {
     "commits_scanned": 10,
     "findings": 2,
-    "files_touched": null
+    "raw_findings": 3,
+    "files_touched": 2,
+    "min_confidence": 0.6,
+    "llm_cache_entries": 1
   },
   "errors": []
 }
@@ -131,17 +145,33 @@ If you add new detection patterns or adjust logic, make sure to add coverage the
 
 ---
 
+## 📊 Benchmarking
+
+Generate a reproducible synthetic benchmark with labeled secrets and benign distractor lines:
+
+```bash
+python benchmarks/benchmark_scanner.py \
+  --repos 10 \
+  --commits-per-repo 20 \
+  --seed 1337 \
+  --markdown-out docs/benchmark_results.md
+```
+
+The current saved benchmark scanned 10 generated repositories / 200 commits / 100 labeled secret lines. With `--min-confidence 0.75`, it reduced line-level false positives from 50 to 0 while keeping 100% recall on this synthetic benchmark. See `docs/benchmark_results.md` for the full table and caveats.
+
+---
+
 ## ⚠️ Limitations & Future Work
 
 This scanner focuses on added lines in commits, so secrets previously committed but unchanged might escape detection.
 When two different secrets occur on the same line, merging logic may need further tuning to distinguish them.
-LLM cost and latency: enabling --llm will incur API calls; caching calls might help this.
+LLM cost and latency: enabling --llm will incur API calls; use --llm-cache for repeated scans over the same diffs.
 Entropy thresholds and regex patterns may produce false positives (placeholders, test keys). Consider refining patterns or adding exclusions.
 
 Future enhancements might include:
 - multi-line secret detection (private keys)
 - real-time CI integration (pre-commit hooks)
-- extension of the CLI to allow users to configure more runtime parameters (e.g. minimum confidence thresholds, entropy sensitivity, excluded paths, LLM model selection)
+- extension of the CLI to allow users to configure more runtime parameters (e.g. LLM model selection)
 - support for alternative LLM providers or self-hosted models
 - checks for personal information (e.g. Credit Card Numbers, Social Security Numbers, Phone Numbers, Names / Addresses)
 

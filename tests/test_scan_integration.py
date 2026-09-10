@@ -3,8 +3,8 @@ import os
 import json
 import subprocess
 from pathlib import Path
-import pytest
 
+import scan
 from scan import scan_repo
 
 
@@ -49,7 +49,22 @@ def test_scan_repo_detects_secrets_no_llm(tmp_path):
     assert all("llm" not in (f.get("source") or "") for f in findings)
 
 
-def test_scan_repo_detects_secrets_with_llm(tmp_path):
+def test_scan_repo_detects_secrets_with_llm(tmp_path, monkeypatch):
+    def fake_analyze_commit_with_llm(commit_msg, diff_text, cache=None):
+        return [
+            {
+                "file_path": "secrets.py",
+                "line_start": 1,
+                "line_end": 1,
+                "line_snippet": "AWS_ACCESS_KEY_ID",
+                "finding_type": "Potential Secret",
+                "rationale": "Stubbed LLM finding for integration test",
+                "confidence": 0.8,
+            }
+        ]
+
+    monkeypatch.setattr(scan, "analyze_commit_with_llm", fake_analyze_commit_with_llm)
+
     repo_path = make_test_repo()
     out = tmp_path / "report.json"
     scan_repo(repo_path, n_commits=1, output_file=str(out), use_llm=True)

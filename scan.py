@@ -1,17 +1,17 @@
 import argparse
+import hashlib
 import json
 import os
 import re
-import sys
 import shutil
 import tempfile
+from fnmatch import fnmatch
 from pathlib import Path
 from math import log2
 from datetime import datetime, timezone
 
 import git
 from git import NULL_TREE
-from openai import OpenAI
 
 # ----------------------------------------------------
 # Optional OpenAI setup (lazy)
@@ -19,12 +19,43 @@ from openai import OpenAI
 from dotenv import load_dotenv
 load_dotenv()
 
+LLM_MODEL = "gpt-4o-mini"
+
 def get_openai_client_or_none():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
-    from openai import OpenAI
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return None
     return OpenAI(api_key=api_key)
+
+def load_llm_cache(cache_file: str | None) -> dict[str, list[dict]]:
+    if not cache_file:
+        return {}
+    path = Path(cache_file)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_llm_cache(cache_file: str | None, cache: dict[str, list[dict]]) -> None:
+    if not cache_file:
+        return
+    path = Path(cache_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, indent=2))
+
+def _llm_cache_key(commit_msg: str, diff_text: str) -> str:
+    payload = json.dumps(
+        {"model": LLM_MODEL, "commit_msg": commit_msg, "diff_text": diff_text},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 # ----------------------------------------------------
 # Ignore lists for paths
@@ -48,7 +79,7 @@ def is_binary_diff(d) -> bool:
     _, ext = os.path.splitext(p)
     return ext in BINARY_EXTS
 
-def should_ignore_path(p: str) -> bool:
+def should_ignore_path(p: str, extra_patterns: list[str] | None = None) -> bool:
     from pathlib import PurePosixPath
     if not p:
         return True
@@ -56,6 +87,8 @@ def should_ignore_path(p: str) -> bool:
     if any(part in IGNORE_DIRS for part in parts):
         return True
     if any(p.endswith(f) for f in IGNORE_FILES):
+        return True
+    if extra_patterns and any(fnmatch(p, pattern) for pattern in extra_patterns):
         return True
     return False
 
@@ -143,6 +176,12 @@ def _combine_confidence(c1: float, c2: float) -> float:
     combined = 1 - (1 - min(1, c1)) * (1 - min(1, c2))
     return round(min(1.0, combined), 3)
 
+def _confidence(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
 def _key_for_merge(f: dict) -> tuple:
     return (
         f.get("commit"),
@@ -154,6 +193,7 @@ def merge_findings(findings: list[dict]) -> list[dict]:
     merged = {}
     for f in findings:
         f.setdefault("confidence", 0.5)
+        f["confidence"] = _confidence(f.get("confidence"), 0.5)
         f.setdefault("finding_type", "Potential Secret")
 
         k = _key_for_merge(f)
@@ -161,9 +201,11 @@ def merge_findings(findings: list[dict]) -> list[dict]:
             merged[k] = f
         else:
             cur = merged[k]
+            cur_confidence = _confidence(cur.get("confidence"))
+            new_confidence = _confidence(f.get("confidence"))
+            cur["confidence"] = _combine_confidence(cur_confidence, new_confidence)
             # keep highest confidence
-            if f.get("confidence", 0) > cur.get("confidence", 0):
-                cur["confidence"] = _combine_confidence(cur.get("confidence", 0.0), f.get("confidence", 0.0))
+            if new_confidence > cur_confidence:
                 cur["finding_type"] = f.get("finding_type", cur.get("finding_type"))
                 # prefer path if missing
                 if not cur.get("file_path") and f.get("file_path"):
@@ -180,7 +222,16 @@ def merge_findings(findings: list[dict]) -> list[dict]:
 # ----------------------------------------------------
 # Build final report structure
 # ----------------------------------------------------
-def make_report(repo_source: str, commits_scanned: list[str], findings: list, errors: list[str]):
+def make_report(
+    repo_source: str,
+    commits_scanned: list[str],
+    findings: list,
+    errors: list[str],
+    files_touched: int | None = None,
+    raw_findings: int | None = None,
+    min_confidence: float = 0.0,
+    llm_cache_entries: int | None = None,
+):
     return {
         "repo": repo_source,
         "scanned_at": datetime.now(timezone.utc).isoformat(),
@@ -193,7 +244,10 @@ def make_report(repo_source: str, commits_scanned: list[str], findings: list, er
         "stats": {
             "commits_scanned": len(commits_scanned),
             "findings": len(findings),
-            "files_touched": None,  # could compute if you want
+            "raw_findings": raw_findings if raw_findings is not None else len(findings),
+            "files_touched": files_touched,
+            "min_confidence": min_confidence,
+            "llm_cache_entries": llm_cache_entries,
         },
         "errors": errors,
     }
@@ -230,12 +284,12 @@ def iter_added_lines_with_lineno(patch_text: str):
 # ----------------------------------------------------
 # Build combined added diff for LLM analysis
 # ----------------------------------------------------
-def build_combined_added_diff(diffs, max_chars: int):
+def build_combined_added_diff(diffs, max_chars: int, exclude_paths: list[str] | None = None):
     parts = []
     used = 0
     for d in diffs:
         fname = d.b_path or d.a_path
-        if should_ignore_path(fname) or is_binary_diff(d) or d.diff is None:
+        if should_ignore_path(fname, exclude_paths) or is_binary_diff(d) or d.diff is None:
             continue
         patch_text = d.diff.decode("utf-8", "ignore")
         file_lines = []
@@ -280,11 +334,19 @@ def extract_json_from_text(text: str):
                 pass
     return []
 
-def analyze_commit_with_llm(commit_msg: str, diff_text: str):
+def analyze_commit_with_llm(
+    commit_msg: str,
+    diff_text: str,
+    cache: dict[str, list[dict]] | None = None,
+):
     """
     Ask the LLM to find secrets or sensitive data in this commit.
     Returns a list of findings.
     """
+    cache_key = _llm_cache_key(commit_msg, diff_text)
+    if cache is not None and cache_key in cache:
+        return [dict(item) for item in cache[cache_key]]
+
     prompt = f"""
 You are a security engineer reviewing a git commit diff.
 Analyze the following diff and commit message for any potential secrets,
@@ -311,7 +373,7 @@ Diff:
         return []  # LLM disabled/missing key; safe no-op
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": "You are an expert security analyst."},
                 {"role": "user", "content": prompt},
@@ -321,10 +383,14 @@ Diff:
         text = resp.choices[0].message.content.strip()
         data = extract_json_from_text(text)
         if isinstance(data, list):
-            return data
+            findings = data
         elif isinstance(data, dict):
-            return [data]
-        return []
+            findings = [data]
+        else:
+            findings = []
+        if cache is not None:
+            cache[cache_key] = findings
+        return findings
     except Exception as e:
         print(f"LLM analysis failed: {e}")
         return []
@@ -340,10 +406,16 @@ def scan_repo(
     output_file: str,
     use_llm: bool = False,
     max_diff_chars: int = 12000,
+    min_confidence: float = 0.0,
+    entropy_threshold: float = ENTROPY_THRESHOLD,
+    exclude_paths: list[str] | None = None,
+    llm_cache_file: str | None = None,
 ):
     repo, tmpdir = open_repo(path_or_url)
     results: list[dict] = []
     errors: list[str] = []
+    touched_files: set[str] = set()
+    llm_cache = load_llm_cache(llm_cache_file) if use_llm and llm_cache_file else None
 
     try:
         # Collect commits and hashes up-front for provenance in the report
@@ -363,9 +435,9 @@ def scan_repo(
 
                 # --- 1) LLM-first phase (build combined diff only if enabled) ---
                 if use_llm:
-                    combined_diff = build_combined_added_diff(diffs, max_diff_chars)
+                    combined_diff = build_combined_added_diff(diffs, max_diff_chars, exclude_paths)
                     if combined_diff:
-                        llm_findings = analyze_commit_with_llm(commit.message, combined_diff)
+                        llm_findings = analyze_commit_with_llm(commit.message, combined_diff, llm_cache)
                         for f in llm_findings:
                             f["commit"] = commit.hexsha
                             f["source"] = "llm"  # tag for provenance/merging
@@ -383,8 +455,14 @@ def scan_repo(
 
                     fname = d.b_path or d.a_path
                     print(f"  - {ctype} {fname}")
-                    if not fname or d.diff is None:
+                    if (
+                        not fname
+                        or d.diff is None
+                        or should_ignore_path(fname, exclude_paths)
+                        or is_binary_diff(d)
+                    ):
                         continue
+                    touched_files.add(fname)
 
                     patch_text = d.diff.decode("utf-8", "ignore")
 
@@ -413,7 +491,7 @@ def scan_repo(
                             if PURE_HEX.match(tok) or UUID_LIKE.match(tok):
                                 continue
                             H = shannon_entropy(tok)
-                            if H >= ENTROPY_THRESHOLD:
+                            if H >= entropy_threshold:
                                 conf = min(1.0, max(0.0, (H - 3.0) / 3.0))  # entropy → confidence
                                 results.append({
                                     "commit": commit.hexsha,
@@ -435,13 +513,25 @@ def scan_repo(
 
         # --- 3) Merge duplicates / combine sources & confidence
         merged = merge_findings(results)
+        filtered = [f for f in merged if _confidence(f.get("confidence")) >= min_confidence]
 
         # --- 4) Build and write structured report
-        report = make_report(path_or_url, commit_hashes, merged, errors)
+        report = make_report(
+            path_or_url,
+            commit_hashes,
+            filtered,
+            errors,
+            files_touched=len(touched_files),
+            raw_findings=len(merged),
+            min_confidence=min_confidence,
+            llm_cache_entries=len(llm_cache) if llm_cache is not None else None,
+        )
         with open(output_file, "w") as f:
             json.dump(report, f, indent=2)
+        if llm_cache is not None:
+            save_llm_cache(llm_cache_file, llm_cache)
 
-        print(f"\nWrote report to {output_file} (findings={len(merged)}, errors={len(errors)})")
+        print(f"\nWrote report to {output_file} (findings={len(filtered)}, errors={len(errors)})")
 
     finally:
         if tmpdir and os.path.isdir(tmpdir):
@@ -460,6 +550,39 @@ if __name__ == "__main__":
     parser.add_argument("--no-llm", dest="use_llm", action="store_false", help="Disable LLM triage (default)")
     parser.set_defaults(use_llm=False)
     parser.add_argument("--max-diff-chars", type=int, default=12000, help="Cap combined diff sent to LLM")
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=0.0,
+        help="Only include findings at or above this confidence in the final report",
+    )
+    parser.add_argument(
+        "--entropy-threshold",
+        type=float,
+        default=ENTROPY_THRESHOLD,
+        help="Shannon entropy threshold for generic high-entropy token findings",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Additional path glob to skip; can be supplied more than once",
+    )
+    parser.add_argument(
+        "--llm-cache",
+        default=None,
+        help="Optional JSON cache file for LLM findings",
+    )
 
     args = parser.parse_args()
-    scan_repo(args.repo, args.n, args.out, use_llm=args.use_llm, max_diff_chars=args.max_diff_chars)
+    scan_repo(
+        args.repo,
+        args.n,
+        args.out,
+        use_llm=args.use_llm,
+        max_diff_chars=args.max_diff_chars,
+        min_confidence=args.min_confidence,
+        entropy_threshold=args.entropy_threshold,
+        exclude_paths=args.exclude,
+        llm_cache_file=args.llm_cache,
+    )
